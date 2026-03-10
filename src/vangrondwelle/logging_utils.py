@@ -34,3 +34,4 @@ def configure_logging(verbose: bool) -> None:
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
     root_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logging.getLogger("urllib3").setLevel(logging.INFO)
