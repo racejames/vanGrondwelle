@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from dataclasses import dataclass
 from collections.abc import Iterable
 
 import requests
@@ -15,6 +16,29 @@ LOGGER = logging.getLogger(__name__)
 OVERPASS_API_URL = "https://overpass-api.de/api/interpreter"
 GOOGLE_PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
 KVK_SEARCH_URL = "https://api.kvk.nl/api/v2/zoeken"
+
+
+@dataclass(frozen=True, slots=True)
+class BunnikBoundary:
+    name: str
+    aliases: tuple[str, ...]
+    bbox: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class BunnikGeographyResolution:
+    boundary_name: str
+    city: str | None
+    street_address: str | None
+    postcode: str | None
+    inside_bunnik: bool
+
+
+BUNNIK_BOUNDARY = BunnikBoundary(
+    name="Bunnik",
+    aliases=("bunnik",),
+    bbox=(52.0460360, 52.0745627, 5.1530306, 5.2250220),
+)
 
 
 def build_business_comparison(
@@ -145,7 +169,7 @@ def fetch_google_places_business(
     places = response.json().get("places", [])
     if not isinstance(places, list) or not places:
         return None
-    return places[0]
+    return _select_google_places_match(places, business_name, location)
 
 
 def fetch_kvk_business(
@@ -187,7 +211,11 @@ def fetch_kvk_business(
         headers={"apikey": api_key, "User-Agent": USER_AGENT},
     )
     detail_response.raise_for_status()
-    return detail_response.json()
+    detail_payload = detail_response.json()
+    if location and _normalized_token(location) == _normalized_token(BUNNIK_BOUNDARY.name):
+        if not _matches_location(resolve_bunnik_geography(detail_payload, provider="kvk"), _normalized_token(location)):
+            return None
+    return detail_payload
 
 
 def _build_osm_row(
@@ -398,13 +426,36 @@ def _select_osm_match(
         tags = element.get("tags", {})
         if not isinstance(tags, dict):
             continue
+        geography = resolve_bunnik_geography(element, provider="osm")
         candidate_name = _normalized_token(_string(tags.get("name")))
-        candidate_city = _normalized_token(_string(tags.get("addr:city")) or _string(tags.get("addr:place")))
-        if candidate_name == normalized_name and (not candidate_city or candidate_city == normalized_location):
+        if candidate_name == normalized_name and _matches_location(geography, normalized_location):
             return element
     for element in elements:
         if isinstance(element, dict):
-            return element
+            if normalized_location != _normalized_token(BUNNIK_BOUNDARY.name):
+                tags = element.get("tags", {})
+                if not isinstance(tags, dict):
+                    continue
+                candidate_name = _normalized_token(_string(tags.get("name")))
+                if candidate_name == normalized_name:
+                    return element
+    return None
+
+
+def _select_google_places_match(
+    places: list[object],
+    business_name: str,
+    location: str,
+) -> dict[str, object] | None:
+    normalized_name = _normalized_token(business_name)
+    normalized_location = _normalized_token(location)
+    for place in places:
+        if not isinstance(place, dict):
+            continue
+        geography = resolve_bunnik_geography(place, provider="google_places")
+        name = _normalized_token(_place_display_name(place))
+        if name == normalized_name and _matches_location(geography, normalized_location):
+            return place
     return None
 
 
@@ -418,20 +469,62 @@ def _select_kvk_match(
     for result in results:
         if not isinstance(result, dict):
             continue
+        geography = resolve_bunnik_geography(result, provider="kvk")
         name = _normalized_token(_string(result.get("naam")))
-        address = result.get("adres", {}) if isinstance(result, dict) else {}
-        if not isinstance(address, dict):
-            address = {}
-        domestic = address.get("binnenlandsAdres", {})
-        if not isinstance(domestic, dict):
-            domestic = {}
-        city = _normalized_token(_string(domestic.get("plaats")) or _string(result.get("plaats")))
-        if name == normalized_name and (not city or city == normalized_location):
+        if name == normalized_name and _matches_location(geography, normalized_location):
             return result
     for result in results:
         if isinstance(result, dict):
-            return result
+            if normalized_location != _normalized_token(BUNNIK_BOUNDARY.name):
+                name = _normalized_token(_string(result.get("naam")))
+                if name == normalized_name:
+                    return result
     return None
+
+
+def resolve_bunnik_geography(candidate: dict[str, object], *, provider: str) -> BunnikGeographyResolution:
+    normalized_provider = _normalized_token(provider)
+    if normalized_provider == "osm":
+        tags = candidate.get("tags", {})
+        if not isinstance(tags, dict):
+            tags = {}
+        city = _string(tags.get("addr:city")) or _string(tags.get("addr:place"))
+        street_address = _compose_address(_string(tags.get("addr:street")), _string(tags.get("addr:housenumber")))
+        postcode = _string(tags.get("addr:postcode"))
+        if city is None:
+            inside_bunnik = _osm_candidate_is_inside_bunnik(candidate)
+        else:
+            inside_bunnik = _normalized_token(city) in {alias for alias in BUNNIK_BOUNDARY.aliases}
+    elif normalized_provider == "googleplaces":
+        components = _index_address_components(candidate.get("addressComponents"))
+        city = components.get("locality") or components.get("postal_town") or components.get("administrative_area_level_2")
+        street_address = _compose_address(components.get("route"), components.get("street_number"))
+        postcode = components.get("postal_code")
+        if street_address is None:
+            street_address = _string(candidate.get("formattedAddress"))
+        if city is None:
+            city = _address_text_bunnik_locality(_string(candidate.get("formattedAddress")))
+        inside_bunnik = _normalized_token(city) in {alias for alias in BUNNIK_BOUNDARY.aliases}
+    elif normalized_provider == "kvk":
+        address = _kvk_address(candidate)
+        city = address["city"] or _string(candidate.get("plaats"))
+        street_address = address["street_address"] or _string(candidate.get("volledigAdres"))
+        postcode = address["postcode"]
+        if city is None:
+            city = _address_text_bunnik_locality(_string(candidate.get("volledigAdres")))
+        inside_bunnik = _normalized_token(city) in {alias for alias in BUNNIK_BOUNDARY.aliases}
+    else:
+        city = _string(candidate.get("city")) or _string(candidate.get("plaats"))
+        street_address = _string(candidate.get("street_address")) or _string(candidate.get("volledigAdres"))
+        postcode = _string(candidate.get("postcode"))
+        inside_bunnik = _normalized_token(city) in {alias for alias in BUNNIK_BOUNDARY.aliases}
+    return BunnikGeographyResolution(
+        boundary_name=BUNNIK_BOUNDARY.name,
+        city=city,
+        street_address=street_address,
+        postcode=postcode,
+        inside_bunnik=inside_bunnik,
+    )
 
 
 def _extract_kvk_detail_url(result: dict[str, object]) -> str | None:
@@ -492,7 +585,7 @@ def _kvk_address(result: dict[str, object]) -> dict[str, str | None]:
         "street_address": _string(visit_address.get("volledigAdres"))
         or _compose_address(_string(visit_address.get("straatnaam")), _string(visit_address.get("huisnummer"))),
         "postcode": _string(visit_address.get("postcode")),
-        "city": _string(visit_address.get("plaats")),
+        "city": _string(visit_address.get("plaats")) or _string(result.get("plaats")),
     }
 
 
@@ -538,6 +631,54 @@ def _first_sequence_value(values: object) -> str | None:
 def _normalized_token(value: str | None) -> str:
     text = normalize_text(value) or ""
     return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _matches_location(geography: BunnikGeographyResolution, normalized_location: str) -> bool:
+    if normalized_location == _normalized_token(BUNNIK_BOUNDARY.name):
+        return geography.inside_bunnik
+    candidate_city = _normalized_token(geography.city)
+    return not candidate_city or candidate_city == normalized_location
+
+
+def _osm_candidate_is_inside_bunnik(candidate: dict[str, object]) -> bool:
+    coordinates = _osm_candidate_coordinates(candidate)
+    if coordinates is None:
+        return False
+    south, north, west, east = BUNNIK_BOUNDARY.bbox
+    lat, lon = coordinates
+    return south <= lat <= north and west <= lon <= east
+
+
+def _osm_candidate_coordinates(candidate: dict[str, object]) -> tuple[float, float] | None:
+    lat = candidate.get("lat")
+    lon = candidate.get("lon")
+    if lat is not None and lon is not None:
+        maybe_coordinates = _coordinate_pair(lat, lon)
+        if maybe_coordinates is not None:
+            return maybe_coordinates
+
+    center = candidate.get("center")
+    if isinstance(center, dict):
+        maybe_coordinates = _coordinate_pair(center.get("lat"), center.get("lon"))
+        if maybe_coordinates is not None:
+            return maybe_coordinates
+    return None
+
+
+def _coordinate_pair(lat_value: object, lon_value: object) -> tuple[float, float] | None:
+    try:
+        return float(lat_value), float(lon_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _address_text_bunnik_locality(address_text: str | None) -> str | None:
+    if not address_text:
+        return None
+    normalized = normalize_text(address_text).lower()
+    if re.search(r"\bbunnik\b", normalized):
+        return BUNNIK_BOUNDARY.name
+    return None
 
 
 def _string(value: object) -> str | None:
